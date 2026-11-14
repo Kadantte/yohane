@@ -6,18 +6,18 @@ By default, it now uses our [NextFire/mms-300m-ForcedAligner-karaoke-ja-Latn](ht
 
 ## Getting Started
 
+### Hugging Face Space (ZeroGPU free tier)
+
+<a target="_blank" href="https://nextfire-yohane.hf.space">
+  <img src="https://huggingface.co/datasets/huggingface/badges/resolve/main/open-in-hf-spaces-sm-dark.svg" alt="Open In HF Spaces"/>
+</a>
+
 ### Google Colab (Free GPU)
 
 Open the provided [notebook](notebook/yohane.ipynb) in Google Colab and use their free T4 GPUs:
 
 <a target="_blank" href="https://colab.research.google.com/github/Japan7/yohane/blob/main/notebook/yohane.ipynb">
   <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
-</a>
-
-### Hugging Face Space (CPU-only)
-
-<a target="_blank" href="https://nextfire-yohane.hf.space">
-  <img src="https://huggingface.co/datasets/huggingface/badges/resolve/main/open-in-hf-spaces-sm-dark.svg" alt="Open In HF Spaces"/>
 </a>
 
 ### Local Environment
