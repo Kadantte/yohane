@@ -1,132 +1,176 @@
 import logging
 from abc import ABC, abstractmethod
-from importlib.resources import as_file, files
-from pathlib import Path
-from typing import cast
+from collections.abc import Callable
+from typing import Any, cast
 
 import torch
-import torchaudio
-import vocal_remover.models
-from torchaudio.pipelines import HDEMUCS_HIGH_MUSDB_PLUS
-from torchaudio.pipelines import MMS_FA as fa_bundle
+from torchaudio.functional import TokenSpan, merge_tokens, resample
+from torchaudio.pipelines import HDEMUCS_HIGH_MUSDB_PLUS, MMS_FA
+from torchaudio.pipelines._wav2vec2 import aligner
 from torchaudio.transforms import Fade
-from vocal_remover.inference import Separator
-from vocal_remover.lib import nets, spec_utils
+from transformers import Wav2Vec2CTCTokenizer, Wav2Vec2ForCTC, Wav2Vec2Processor
 
 logger = logging.getLogger(__name__)
 
+TokenizerFn = Callable[[list[str]], list[list[int]]]
 
-def compute_alignments(waveform: torch.Tensor, sample_rate: int, transcript: list[str]):
+
+class ForcedAligner(ABC):
+    @abstractmethod
+    def tokenize(
+        self,
+        batch: list[str],
+    ) -> list[list[int]]: ...
+
+    @abstractmethod
+    def align(
+        self,
+        tokens: list[list[int]],
+        waveform: torch.Tensor,
+        sample_rate: int,
+    ) -> tuple[torch.Tensor, list[list[TokenSpan]]]: ...
+
+
+class TorchAudioForcedAligner(ForcedAligner):
     """
     https://pytorch.org/audio/stable/tutorials/forced_alignment_for_multilingual_data_tutorial.html
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using {device=}")
 
-    waveform = waveform.mean(0, keepdim=True)
-    waveform, sample_rate = (
-        torchaudio.functional.resample(
-            waveform, sample_rate, int(fa_bundle.sample_rate)
-        ),
-        int(fa_bundle.sample_rate),
+    bundle = MMS_FA
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tokenizer = self.bundle.get_tokenizer()
+        self.model = self.bundle.get_model()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # pyright: ignore[reportPrivateImportUsage]
+        self.model.to(self.device)
+        self.aligner = self.bundle.get_aligner()
+
+    def tokenize(self, batch: list[str]):
+        return cast(list[list[int]], self.tokenizer(batch))
+
+    def align(self, tokens: list[list[int]], waveform: torch.Tensor, sample_rate: int):
+        logger.info(f"TorchAudioForcedAligner: running MMS_FA on {self.device=}")
+        waveform = resample(waveform, sample_rate, int(self.bundle.sample_rate))
+        waveform = waveform.mean(0, keepdim=True)
+        with torch.inference_mode():
+            emission, _ = self.model(waveform.to(self.device))
+            emission = cast(torch.Tensor, emission)
+        token_spans = self.aligner(emission[0], tokens)
+        return emission, token_spans
+
+
+class Wav2Vec2ForcedAligner(ForcedAligner):
+    def __init__(self, model: str) -> None:
+        super().__init__()
+        self.model_id = model
+        self.processor = Wav2Vec2Processor.from_pretrained(model)
+        self.model = Wav2Vec2ForCTC.from_pretrained(model)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # pyright: ignore[reportPrivateImportUsage]
+        self.model.to(self.device)  # pyright: ignore[reportArgumentType]
+        blank = self.model.config.pad_token_id
+        assert blank is not None
+        self.blank = blank
+
+    @property
+    def tokenizer(self) -> Wav2Vec2CTCTokenizer:
+        return self.processor.tokenizer  # pyright: ignore[reportAttributeAccessIssue]
+
+    def tokenize(self, batch: list[str]):
+        return [self.tokenizer.encode(e, add_special_tokens=False) for e in batch]
+
+    def align(self, tokens: list[list[int]], waveform: torch.Tensor, sample_rate: int):
+        logger.info(f"Wav2Vec2ForcedAligner: running {self.model_id} on {self.device=}")
+        target_sample_rate = self.processor.feature_extractor.sampling_rate  # pyright: ignore[reportAttributeAccessIssue]
+        waveform = resample(waveform, sample_rate, target_sample_rate)
+        sample_rate = target_sample_rate
+        waveform = waveform.mean(0)
+        inputs = self.processor(
+            audio=waveform.numpy(),
+            sampling_rate=sample_rate,  # pyright: ignore[reportCallIssue]
+            return_tensors="pt",  # pyright: ignore[reportCallIssue]
+        )
+        with torch.inference_mode():
+            outputs = self.model(**inputs.to(self.device))
+            emission = torch.nn.functional.log_softmax(outputs.logits, dim=-1)
+        token_spans = _align_token_spans(emission[0], tokens, blank=self.blank)
+        return emission, token_spans
+
+
+def _align_token_spans(
+    emission: torch.Tensor, tokens: list[list[int]], *, blank: int
+) -> list[list[TokenSpan]]:
+    aligned_tokens, scores = aligner._align_emission_and_tokens(
+        emission, _flatten_token_sequences(tokens), blank=blank
     )
-
-    model = fa_bundle.get_model()
-    model.to(device)
-
-    tokenizer = fa_bundle.get_tokenizer()
-    aligner = fa_bundle.get_aligner()
-
-    with torch.inference_mode():
-        emission, _ = model(waveform.to(device))
-        emission = cast(torch.Tensor, emission)
-        tokens = tokenizer(transcript)
-        tokens = cast(list[list[int]], tokens)
-        token_spans = aligner(emission[0], tokens)
-
-    return emission, token_spans
+    spans = merge_tokens(aligned_tokens, scores, blank=blank)
+    return _unflatten_token_spans(spans, [len(seq) for seq in tokens])
 
 
-class VocalsExtractor(ABC):
+def _flatten_token_sequences(tokens: list[list[int]]) -> list[int]:
+    return [token for seq in tokens for token in seq]
+
+
+def _unflatten_token_spans(
+    spans: list[TokenSpan], token_lengths: list[int]
+) -> list[list[TokenSpan]]:
+    if len(spans) != sum(token_lengths):
+        raise RuntimeError(
+            "Forced alignment returned a different number of token spans than tokens."
+        )
+    offset = 0
+    grouped_spans: list[list[TokenSpan]] = []
+    for length in token_lengths:
+        grouped_spans.append(spans[offset : offset + length])
+        offset += length
+    return grouped_spans
+
+
+class Separator(ABC):
     @abstractmethod
     def __call__(
         self, waveform: torch.Tensor, sample_rate: int
-    ) -> tuple[torch.Tensor, int]:
-        ...
+    ) -> tuple[torch.Tensor, int]: ...
 
 
-class VocalRemoverVocalsExtractor(VocalsExtractor):
+class VocalRemoverSeparator(Separator):
     """
     https://github.com/tsurumeso/vocal-remover
     """
 
-    def __init__(
-        self,
-        pretrained_model: Path | None = None,
-        n_fft: int = 2048,
-        hop_length: int = 1024,
-        batchsize: int = 4,
-        cropsize: int = 256,
-    ):
+    def __init__(self):
         super().__init__()
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.batchsize = batchsize
-        self.cropsize = cropsize
+        from vocal_remover.transformer.modeling import VocalRemoverModel
+        from vocal_remover.transformer.pipeline import VocalRemoverPipeline
 
-        if pretrained_model is not None:
-            self.pretrained_model = pretrained_model
-        else:
-            state_resource = files(vocal_remover.models) / "baseline.pth"
-            with as_file(state_resource) as path:
-                self.pretrained_model = path
+        self.model = VocalRemoverModel.from_pretrained(
+            "NextFire/tsurumeso-vocal-remover"
+        )
+        self.pipeline = VocalRemoverPipeline(self.model)
 
     def __call__(self, waveform: torch.Tensor, sample_rate: int):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Using {device=}")
-
-        model = nets.CascadedNet(self.n_fft, self.hop_length, 32, 128, True)
-        model.load_state_dict(
-            torch.load(self.pretrained_model, map_location=torch.device("cpu"))
-        )
-        model.to(device)
-
-        waveform = waveform.repeat(2, 1) if waveform.ndim == 1 else waveform
-
-        waveform_spec = spec_utils.wave_to_spectrogram(
-            waveform.numpy(), self.hop_length, self.n_fft
-        )
-
-        sp = Separator(
-            model,
-            device,
-            self.batchsize,
-            self.cropsize,
-        )
-        _, vocals_spec = sp.separate(waveform_spec)
-
-        vocals = spec_utils.spectrogram_to_wave(vocals_spec, hop_length=self.hop_length)
-
-        return torch.Tensor(vocals), sample_rate
+        outputs = cast(dict[str, Any], self.pipeline(waveform))
+        return torch.Tensor(outputs["vocals"]), sample_rate
 
 
-class HybridDemucsVocalsExtractor(VocalsExtractor):
+class HybridDemucsSeparator(Separator):
     """
     https://pytorch.org/audio/2.1.0/tutorials/hybrid_demucs_tutorial.html
     """
 
+    bundle = HDEMUCS_HIGH_MUSDB_PLUS
+
     def __init__(self, segment=10.0, overlap=0.1):
         super().__init__()
-        self.bundle = HDEMUCS_HIGH_MUSDB_PLUS
         self.segment = segment
         self.overlap = overlap
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # pyright: ignore[reportPrivateImportUsage]
 
     def separate_sources(
         self,
         mix: torch.Tensor,
         sample_rate: int,
         model: torch.nn.Module,
-        device: torch.device,
     ):
         batch, channels, length = mix.shape
 
@@ -138,7 +182,10 @@ class HybridDemucsVocalsExtractor(VocalsExtractor):
             fade_in_len=0, fade_out_len=int(overlap_frames), fade_shape="linear"
         )
 
-        final = torch.zeros(batch, len(model.sources), channels, length, device=device)
+        sources_list = cast(list[str], model.sources)
+        final = torch.zeros(  # pyright: ignore[reportPrivateImportUsage]
+            batch, len(sources_list), channels, length, device=self.device
+        )
 
         while start < length - overlap_frames:
             chunk = mix[:, :, start:end]
@@ -157,27 +204,24 @@ class HybridDemucsVocalsExtractor(VocalsExtractor):
         return final
 
     def __call__(self, waveform: torch.Tensor, sample_rate: int):
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Using {device=}")
+        logger.info(f"HybridDemucsSeparator: running on {self.device=}")
 
         waveform, sample_rate = (
-            torchaudio.functional.resample(
-                waveform, sample_rate, self.bundle.sample_rate
-            ),
+            resample(waveform, sample_rate, self.bundle.sample_rate),
             self.bundle.sample_rate,
         )
-        waveform = waveform.to(device)
+        waveform = waveform.to(self.device)
 
         model = self.bundle.get_model()
-        model.to(device)
+        model.to(self.device)
 
         ref = waveform.mean(0)
         waveform = (waveform - ref.mean()) / ref.std()  # normalization
 
-        sources = self.separate_sources(waveform[None], sample_rate, model, device)[0]
+        sources = self.separate_sources(waveform[None], sample_rate, model)[0]
         sources = sources * ref.std() + ref.mean()
 
-        sources_list = model.sources
+        sources_list = cast(list[str], model.sources)
         sources = list(sources)
 
         audios = dict(zip(sources_list, sources))

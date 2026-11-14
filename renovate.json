@@ -2,7 +2,13 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "github>Japan7/renovate-config",
-    "github>Japan7/renovate-config:python",
-    "github>Japan7/renovate-config:python-app"
+    "github>Japan7/renovate-config:python"
+  ],
+  "packageRules": [
+    {
+      "matchManagers": ["pixi"],
+      "matchDepNames": ["python"],
+      "automerge": false
+    }
   ]
 }

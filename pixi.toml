@@ -1,0 +1,41 @@
+[workspace]
+name = "yohane"
+channels = ["conda-forge"]
+platforms = [
+    # { name = "cu134-linux-64", platform = "linux-64", cuda = "13.4" },
+    # { name = "cu134-win-64", platform = "win-64", cuda = "13.4" },
+    { name = "cu132-linux-64", platform = "linux-64", cuda = "13.2" },
+    { name = "cu132-win-64", platform = "win-64", cuda = "13.2" },
+    { name = "cpu-linux-64", platform = "linux-64" },
+    { name = "cpu-win-64", platform = "win-64" },
+    { platform = "osx-arm64", macos = "14.0" },
+]
+
+[dependencies]
+python = "~=3.14.0"
+ffmpeg = "~=9.0"
+
+[pypi-dependencies]
+yohane = { path = ".", editable = true }
+yohane-cli = { path = "yohane-cli", editable = true }
+vocal-remover = { git = "https://github.com/Japan7/vocal-remover.git", branch = "6.0.0b4" }
+
+[target."cu134-*".pypi-dependencies]
+torch = { version = "==2.15.0", index = "https://download.pytorch.org/whl/cu134" }
+torchaudio = { version = "==2.11.1", index = "https://download.pytorch.org/whl/cu134" }
+torchcodec = { version = "==0.17.0", index = "https://download.pytorch.org/whl/cu134" }
+
+[target."cu132-*".pypi-dependencies]
+torch = { version = "==2.15.0", index = "https://download.pytorch.org/whl/cu132" }
+torchaudio = { version = "==2.11.1", index = "https://download.pytorch.org/whl/cu132" }
+torchcodec = { version = "==0.17.0", index = "https://download.pytorch.org/whl/cu132" }
+
+[target."cpu-*".pypi-dependencies]
+torch = { version = "==2.15.0", index = "https://download.pytorch.org/whl/cpu" }
+torchaudio = { version = "==2.11.1", index = "https://download.pytorch.org/whl/cpu" }
+torchcodec = { version = "==0.17.0", index = "https://download.pytorch.org/whl/cpu" }
+
+[target."osx-*".pypi-dependencies]
+torch = "==2.15.0"
+torchaudio = "==2.11.1"
+torchcodec = "==0.17.0"
